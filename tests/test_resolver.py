@@ -8,8 +8,16 @@ from app.repository import build_repository, canonical, parse_root_specifier
 from app.resolver import ResolutionLimit, Resolver
 
 
-def resolve(raw_repo, root, spec="", *, allow_prereleases=False):
-    repo = build_repository(raw_repo)
+LINUX_X64_PY311 = {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64",
+}
+
+
+def resolve(raw_repo, root, spec="", *, allow_prereleases=False, environment=None):
+    environment = environment or LINUX_X64_PY311
+    repo = build_repository(raw_repo, environment)
     resolver = Resolver(repo, allow_prereleases=allow_prereleases)
     try:
         state = resolver.resolve(canonical(root), parse_root_specifier(spec), spec)
@@ -336,13 +344,15 @@ def test_deep_backtracking():
 def test_invalid_version_raises():
     from app.repository import SnapshotError
     with pytest.raises(SnapshotError):
-        build_repository({"app": [c("not-a-version")]})
+        build_repository({"app": [c("not-a-version")]}, LINUX_X64_PY311)
 
 
 def test_invalid_specifier_raises():
     from app.repository import SnapshotError
     with pytest.raises(SnapshotError):
-        build_repository({"app": [c("1.0", [d("lib", ">=1.0,<")])]})
+        build_repository(
+            {"app": [c("1.0", [d("lib", ">=1.0,<")])]}, LINUX_X64_PY311
+        )
 
 
 def test_duplicate_version_conflicting_deps_raises():
@@ -353,7 +363,7 @@ def test_duplicate_version_conflicting_deps_raises():
                 c("1.0", [d("x")]),
                 c("1.0", [d("y")]),
             ]
-        })
+        }, LINUX_X64_PY311)
 
 
 # --------------------------------------------------------------------- #
@@ -379,7 +389,7 @@ def test_attempt_limit():
     """搜索上限护栏：attempt_limit=0 时，尝试第一个候选即终止。"""
     from app.repository import build_repository as _b
     repo = {"app": [c("1.0", [d("x")])], "x": [c("1.0")]}
-    r = Resolver(_b(repo), attempt_limit=0)
+    r = Resolver(_b(repo, LINUX_X64_PY311), attempt_limit=0)
     with pytest.raises(ResolutionLimit):
         r.resolve("app", parse_root_specifier(""), "")
     # 超限时仍可拿到 409 负载（status=limit + 已记录的冲突点）
@@ -393,7 +403,7 @@ def test_depth_limit():
     repo = {f"p{i}": [c("1.0", [d(f"p{i+1}")])] for i in range(n - 1)}
     repo[f"p{n-1}"] = [c("1.0")]
     from app.repository import build_repository as _b
-    r = Resolver(_b(repo), depth_limit=10)
+    r = Resolver(_b(repo, LINUX_X64_PY311), depth_limit=10)
     with pytest.raises(ResolutionLimit):
         r.resolve("p0", parse_root_specifier(""), "")
 
@@ -411,3 +421,130 @@ def test_global_single_version_enforced():
     assert list(out["locked"].values()).count("1.9") >= 1
     assert "common" in out["locked"] and "Common" not in out["locked"]
     assert out["locked"]["common"] == "1.9"
+
+
+# --------------------------------------------------------------------- #
+# 13. PEP 508 marker：只有激活的依赖进入约束/回溯/来源链/edges
+# --------------------------------------------------------------------- #
+def dm(name, spec="", marker=""):
+    return {"name": name, "specifier": spec, "marker": marker}
+
+
+def test_marker_inactive_dependency_ignored():
+    repo = {
+        "app": [c("1.0", [
+            dm("active-lib", "", "sys_platform == 'linux'"),
+            # 未激活且与一切冲突（要求不存在的版本）：不得影响求解
+            dm("ghost", "==9.9", "sys_platform == 'win32'"),
+        ])],
+        "active-lib": [c("1.0")],
+        "ghost": [c("1.0")],
+    }
+    out, err = resolve(repo, "app")
+    assert err is None
+    assert out["locked"] == {"app": "1.0", "active-lib": "1.0"}
+    tos = [e["to"] for e in out["edges"]]
+    assert "ghost" not in tos
+
+
+def test_marker_switches_conflict_across_environments():
+    """同一快照：linux 可解，win32 下因激活了苛刻依赖而无解，且来源链完整。"""
+    repo = {
+        "app": [c("1.0", [dm("win-only", "==2.0", "sys_platform == 'win32'")])],
+        "win-only": [c("1.0")],
+    }
+    out, err = resolve(repo, "app")
+    assert err is None and out["locked"] == {"app": "1.0"}
+
+    win = {"python_version": "3.11", "sys_platform": "win32",
+           "platform_machine": "AMD64"}
+    out2, err2 = resolve(repo, "app", environment=win)
+    assert out2 is None
+    subject = err2["_conflicts"][0]
+    assert subject["subject"] == "win-only"
+    assert subject["kind"] == "no_candidates"
+    chain = [(l["package"], l["version"], l["requires"])
+             for l in subject["constraints"][0]["chain"]]
+    assert chain == [(None, None, "*"), ("app", "1.0", "==2.0")]
+
+
+def test_marker_backtracking_uses_only_active_deps():
+    """高版本 app 带的苛刻依赖在 win32 激活、linux 不激活：
+    linux 直接选高版本；win32 必须回溯到不带该依赖的低版本。"""
+    repo = {
+        "app": [
+            c("2.0", [dm("shared", "==9.9", "platform_machine == 'arm64'")]),
+            c("1.0", []),
+        ],
+        "shared": [c("1.0")],
+    }
+    arm = {"python_version": "3.11", "sys_platform": "linux",
+           "platform_machine": "arm64"}
+    out_arm, err_arm = resolve(repo, "app", environment=arm)
+    assert err_arm is None and out_arm["locked"]["app"] == "1.0"  # 回溯
+    out_x64, err_x64 = resolve(repo, "app")
+    assert err_x64 is None and out_x64["locked"] == {"app": "2.0"}
+
+
+def test_marker_complex_expression_and_operators():
+    repo = {
+        "app": [c("1.0", [
+            dm("a", "", "python_version >= '3.10' and python_version < '4'"),
+            dm("b", "", "sys_platform == 'darwin' or sys_platform == 'win32'"),
+            dm("c", "", "'x86_64' in platform_machine"),
+            dm("d", "", "platform_machine != 'arm64'"),
+        ])],
+        "a": [c("1.0")], "b": [c("1.0")],
+        "c": [c("1.0")], "d": [c("1.0")],
+    }
+    out, err = resolve(repo, "app")
+    assert err is None
+    assert set(out["locked"]) == {"app", "a", "c", "d"}  # b 未激活
+
+
+def test_marker_python_version_major_minor_convention():
+    """PEP 508 约定 python_version 为 'major.minor'：按请求值逐字比较。"""
+    repo = {
+        "app": [c("1.0", [
+            dm("new", "", "python_version == '3.11'"),
+        ])],
+        "new": [c("1.0")],
+    }
+    env311 = {"python_version": "3.11", "sys_platform": "linux",
+              "platform_machine": "x86_64"}
+    out, err = resolve(repo, "app", environment=env311)
+    assert err is None and "new" in out["locked"]
+
+    env_patch = {"python_version": "3.11.8", "sys_platform": "linux",
+                 "platform_machine": "x86_64"}
+    out2, err2 = resolve(repo, "app", environment=env_patch)
+    assert err2 is None
+    # 环境值逐字比较，服务端不做截断/归一化
+    assert "new" not in out2["locked"]
+    assert out2["locked"] == {"app": "1.0"}
+
+
+def test_marker_invalid_raises_snapshot_error_with_location():
+    from app.repository import SnapshotError
+    with pytest.raises(SnapshotError) as exc:
+        build_repository(
+            {"app": [c("1.0", [dm("dep", "", "os_name == 'posix'")])]},
+            LINUX_X64_PY311,
+        )
+    message = str(exc.value)
+    assert "app==1.0" in message
+    assert "'dep'" in message
+    assert "os_name" in message
+
+
+def test_marker_same_input_deterministic():
+    repo = {
+        # 2.0 要求 s==2.0（不存在），1.0 接受 s==1.0；高版本失败后回溯。
+        "app": [c("2.0", [dm("s", "==2.0", "sys_platform == 'linux'")]),
+                c("1.0", [dm("s", "==1.0", "sys_platform == 'linux'")])],
+        "s": [c("1.0")],
+    }
+    out1, e1 = resolve(repo, "app")
+    out2, e2 = resolve(repo, "app")
+    assert out1 == out2 and e1 == e2
+    assert out1["locked"] == {"app": "1.0", "s": "1.0"}

@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from .markers import MarkerError, build_environment
 from .repository import (
     SnapshotError,
     build_repository,
@@ -79,11 +80,14 @@ def healthz() -> dict:
 )
 def resolve(request: ResolveRequest):
     root_canonical = canonical(request.root)
+    payload = request.model_dump()
 
     try:
-        repo = build_repository(request.model_dump()["repository"])
+        # marker 求值环境完全来自请求，绝不读取宿主机。
+        environment = build_environment(payload["target_environment"])
+        repo = build_repository(payload["repository"], environment)
         root_spec = parse_root_specifier(request.specifier)
-    except SnapshotError as exc:
+    except (SnapshotError, MarkerError) as exc:
         return JSONResponse(
             status_code=422,
             content={"status": "invalid_snapshot", "message": str(exc)},

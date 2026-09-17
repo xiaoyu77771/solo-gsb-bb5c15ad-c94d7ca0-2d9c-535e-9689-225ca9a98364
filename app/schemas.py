@@ -15,7 +15,7 @@ NAME_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
 
 
 class DependencyIn(BaseModel):
-    """一条声明式依赖（requires_dist 风格，仅支持 PEP 440 约束）。"""
+    """一条声明式依赖（requires_dist 风格，支持 PEP 440 约束 + PEP 508 marker）。"""
 
     model_config = {"extra": "forbid"}
 
@@ -28,6 +28,36 @@ class DependencyIn(BaseModel):
     specifier: str = Field(
         "",
         description="PEP 440 版本约束，如 '>=1.0,<2.0'；空字符串表示不约束。",
+    )
+    marker: str = Field(
+        "",
+        description=(
+            "PEP 508 environment marker，仅可引用 python_version / sys_platform / "
+            "platform_machine 三个变量（由请求的 target_environment 决定是否激活）；"
+            "空字符串表示无条件依赖。"
+        ),
+    )
+
+
+class TargetEnvironmentIn(BaseModel):
+    """marker 求值所需的目标环境；三个键全部必填，值完全取自请求。"""
+
+    model_config = {"extra": "forbid"}
+
+    python_version: str = Field(
+        ...,
+        min_length=1,
+        description="目标解释器版本（PEP 440，如 '3.11' 或 '3.12.3'）。",
+    )
+    sys_platform: str = Field(
+        ...,
+        min_length=1,
+        description="目标系统平台（PEP 508 取值，如 'linux' / 'darwin' / 'win32'）。",
+    )
+    platform_machine: str = Field(
+        ...,
+        min_length=1,
+        description="目标机器架构（如 'x86_64' / 'arm64'）。",
     )
 
 
@@ -53,6 +83,13 @@ class ResolveRequest(BaseModel):
         description=(
             "仓库快照：键为包名（按 PEP 503 规范化匹配，大小写/下划线/点/连字符等价），"
             "值为候选版本列表；列表顺序无关，内部按 PEP 440 版本降序排列。"
+        ),
+    )
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description=(
+            "依赖 marker 的求值环境（必填）：python_version / sys_platform / "
+            "platform_machine；服务端不读取宿主机，marker 仅据此判定激活与否。"
         ),
     )
     root: str = Field(

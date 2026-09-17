@@ -1,0 +1,41 @@
+{
+  "repository": {
+    "app": [
+      {
+        "version": "3.0.0",
+        "dependencies": [
+          {"name": "std-fs", "specifier": ">=1.0",
+           "marker": "sys_platform != 'win32'"},
+          {"name": "win-fs", "specifier": ">=1.0",
+           "marker": "sys_platform == 'win32'"},
+          {"name": "accelerated-json", "specifier": ">=2.0",
+           "marker": "python_version >= '3.12'"},
+          {"name": "arm-crypto", "specifier": "",
+           "marker": "platform_machine == 'arm64'"}
+        ]
+      }
+    ],
+    "std-fs": [
+      {"version": "1.4.0"},
+      {"version": "1.2.0"}
+    ],
+    "win-fs": [
+      {"version": "1.1.0"}
+    ],
+    "accelerated-json": [
+      {"version": "2.2.0"},
+      {"version": "2.0.0"}
+    ],
+    "arm-crypto": [
+      {"version": "0.9.0"}
+    ]
+  },
+  "target_environment": {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64"
+  },
+  "root": "app",
+  "specifier": "",
+  "allow_prereleases": false
+}
