@@ -1,6 +1,7 @@
 """FastAPI 入口：全部数据随请求在本地内存中处理。
 
-* POST /resolve  提交仓库快照 + 根包 + 版本约束，返回锁定清单或冲突来源链
+* POST /resolve  提交仓库快照 + 根包 + 版本约束 + 目标环境（PEP 508 marker
+  在请求环境下求值），返回锁定清单或冲突来源链
 * GET  /healthz  健康检查
 """
 
@@ -26,10 +27,11 @@ from .schemas import (
 app = FastAPI(
     title="本地依赖解析 API",
     description=(
-        "基于 Python packaging（PEP 440/503）与回溯搜索的依赖求解器。"
-        "所有仓库数据随请求提交，本地解析，不访问任何远程索引。"
+        "基于 Python packaging（PEP 440/503/508）与回溯搜索的依赖求解器。"
+        "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
+        "不读取宿主机平台信息。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -79,9 +81,10 @@ def healthz() -> dict:
 )
 def resolve(request: ResolveRequest):
     root_canonical = canonical(request.root)
+    payload = request.model_dump()
 
     try:
-        repo = build_repository(request.model_dump()["repository"])
+        repo = build_repository(payload["repository"], payload["target_environment"])
         root_spec = parse_root_specifier(request.specifier)
     except SnapshotError as exc:
         return JSONResponse(

@@ -15,7 +15,7 @@ NAME_PATTERN = r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$"
 
 
 class DependencyIn(BaseModel):
-    """一条声明式依赖（requires_dist 风格，仅支持 PEP 440 约束）。"""
+    """一条声明式依赖（requires_dist 风格，支持 PEP 440 约束 + PEP 508 marker）。"""
 
     model_config = {"extra": "forbid"}
 
@@ -28,6 +28,36 @@ class DependencyIn(BaseModel):
     specifier: str = Field(
         "",
         description="PEP 440 版本约束，如 '>=1.0,<2.0'；空字符串表示不约束。",
+    )
+    marker: str = Field(
+        "",
+        description=(
+            "PEP 508 环境标记表达式（不含分号），如 \"sys_platform == 'linux'\"；"
+            "仅允许引用 python_version / sys_platform / platform_machine，"
+            "空字符串表示无条件激活。"
+        ),
+    )
+
+
+class TargetEnvironmentIn(BaseModel):
+    """marker 求值所用的目标环境；三项必填且全部取自请求（不读宿主机）。"""
+
+    model_config = {"extra": "forbid"}
+
+    python_version: str = Field(
+        ...,
+        min_length=1,
+        description="目标解释器版本（PEP 440），如 '3.11'、'3.12.4'。",
+    )
+    sys_platform: str = Field(
+        ...,
+        min_length=1,
+        description="目标操作系统，对应 sys_platform，如 'linux'、'win32'、'darwin'。",
+    )
+    platform_machine: str = Field(
+        ...,
+        min_length=1,
+        description="目标 CPU 架构，对应 platform.machine()，如 'x86_64'、'aarch64'、'AMD64'。",
     )
 
 
@@ -60,6 +90,13 @@ class ResolveRequest(BaseModel):
         min_length=1,
         pattern=NAME_PATTERN,
         description="根包名称；必须存在于 repository 中。",
+    )
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description=(
+            "必填的目标环境，用于求解决策与每条依赖的 PEP 508 marker；"
+            "值完全取自请求，服务端不读取宿主机信息。"
+        ),
     )
     specifier: str = Field(
         "",

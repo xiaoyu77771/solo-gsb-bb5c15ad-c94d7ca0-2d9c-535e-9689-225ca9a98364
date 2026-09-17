@@ -1,15 +1,25 @@
 """仓库快照的规范化与解析。
 
-使用 packaging（PEP 440 / PEP 503）完成名称规范化、版本与约束解析。
-非法快照在这里抛出 SnapshotError，由 API 层映射为 HTTP 422。
+使用 packaging（PEP 440 / PEP 503）完成名称规范化、版本与约束解析，
+并按请求给出的目标环境对 PEP 508 marker 求值（仅保留激活的依赖）。
+非法快照或 marker 在这里抛出 SnapshotError，由 API 层映射为 HTTP 422。
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 from packaging.requirements import InvalidRequirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
+
+from .markers import (
+    MarkerError,
+    build_environment,
+    marker_active,
+    parse_marker,
+)
 
 
 def canonical(name: str) -> str:
@@ -70,7 +80,9 @@ def _parse_specifier(raw: str, *, owner: str) -> SpecifierSet:
         raise SnapshotError(f"包 {owner!r} 的版本约束 {raw!r} 不是合法的 PEP 440 约束: {exc}") from exc
 
 
-def build_repository(raw: dict[str, list[dict]]) -> Repository:
+def build_repository(
+    raw: dict[str, list[dict]], target_environment: Mapping[str, str] | None = None
+) -> Repository:
     """把 API 输入构造成 Repository。
 
     入参为纯字典（API 层对 Pydantic 模型 model_dump 后传入），形如::
@@ -78,8 +90,17 @@ def build_repository(raw: dict[str, list[dict]]) -> Repository:
         {"pkg": [{"version": "1.0",
                   "dependencies": [{"name": "dep", "specifier": ">=1.0"]}]}]}
 
+    ``target_environment`` 提供 ``python_version`` / ``sys_platform`` /
+    ``platform_machine`` 三个键；每条依赖的 PEP 508 marker 在该环境下求值，
+    **仅激活的依赖**会进入快照（环境值全部来自请求，不读取宿主机）。
+    marker 语法非法或引用越界变量时抛 SnapshotError（API 层映射为 422）。
+
     候选列表顺序无关，内部按 PEP 440 版本降序排列，保证解析确定性。
     """
+    try:
+        env = build_environment(target_environment) if target_environment else None
+    except MarkerError as exc:
+        raise SnapshotError(str(exc)) from exc
     packages: dict[str, list[Candidate]] = {}
 
     for raw_name, raw_candidates in raw.items():
@@ -96,9 +117,25 @@ def build_repository(raw: dict[str, list[dict]]) -> Repository:
                 ) from exc
 
             deps: list[Dependency] = []
+            owner = f"{cname}=={version}"
             for dep in item.get("dependencies", []):
-                spec = _parse_specifier(dep.get("specifier", ""), owner=f"{cname}=={version}")
-                deps.append(Dependency(dep["name"], dep.get("specifier", "").strip(), spec))
+                dep_name = dep["name"]
+                spec_text = dep.get("specifier", "")
+                spec = _parse_specifier(spec_text, owner=owner)
+                try:
+                    marker = parse_marker(
+                        dep.get("marker", ""),
+                        location=(
+                            f"包 {owner!r} 对 {canonical(dep_name)!r} 的依赖"
+                        ),
+                    )
+                    active = marker_active(marker, env) if env is not None else True
+                except MarkerError as exc:
+                    raise SnapshotError(str(exc)) from exc
+                if not active:
+                    # 未激活依赖：不进入约束、回溯、冲突来源链与边。
+                    continue
+                deps.append(Dependency(dep_name, spec_text.strip(), spec))
 
             candidate = Candidate(version, deps)
             if version in bucket:

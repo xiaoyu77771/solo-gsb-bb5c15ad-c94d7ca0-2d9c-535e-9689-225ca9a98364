@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from app.repository import build_repository, canonical, parse_root_specifier
+from app.repository import SnapshotError, build_repository, canonical, parse_root_specifier
 from app.resolver import ResolutionLimit, Resolver
 
+# 与 examples 保持一致的默认目标环境；测试中可通过 env= 覆盖。
+DEFAULT_ENV = {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64",
+}
 
-def resolve(raw_repo, root, spec="", *, allow_prereleases=False):
-    repo = build_repository(raw_repo)
+
+def resolve(raw_repo, root, spec="", *, allow_prereleases=False, env=None):
+    repo = build_repository(raw_repo, env or DEFAULT_ENV)
     resolver = Resolver(repo, allow_prereleases=allow_prereleases)
     try:
         state = resolver.resolve(canonical(root), parse_root_specifier(spec), spec)
@@ -50,8 +57,8 @@ def c(version, deps=None):
     return {"version": version, "dependencies": deps or []}
 
 
-def d(name, spec=""):
-    return {"name": name, "specifier": spec}
+def d(name, spec="", marker=""):
+    return {"name": name, "specifier": spec, "marker": marker}
 
 
 # --------------------------------------------------------------------- #
@@ -411,3 +418,205 @@ def test_global_single_version_enforced():
     assert list(out["locked"].values()).count("1.9") >= 1
     assert "common" in out["locked"] and "Common" not in out["locked"]
     assert out["locked"]["common"] == "1.9"
+
+
+# --------------------------------------------------------------------- #
+# 13. PEP 508 marker：按请求环境激活，未激活依赖完全不参与
+# --------------------------------------------------------------------- #
+def _marker_repo():
+    return {
+        "app": [
+            c("1.0", [
+                d("linux-only", marker="sys_platform == 'linux'"),
+                d("win-only", marker="sys_platform == 'win32'"),
+                d("arm-only", marker="platform_machine == 'aarch64'"),
+                d("modern", ">=2.0", "python_version >= '3.10'"),
+                d("oldie", marker="python_version < '3.10'"),
+            ])
+        ],
+        "linux-only": [c("1.0")],
+        "win-only": [c("1.0")],
+        "arm-only": [c("1.0")],
+        "modern": [c("2.0"), c("3.0")],
+        "oldie": [c("0.9")],
+    }
+
+
+def test_markers_activate_by_request_environment_linux():
+    out, err = resolve(
+        _marker_repo(), "app",
+        env={"python_version": "3.11", "sys_platform": "linux",
+             "platform_machine": "x86_64"},
+    )
+    assert err is None
+    assert out["locked"] == {"app": "1.0", "linux-only": "1.0", "modern": "3.0"}
+    tos = {e["to"] for e in out["edges"]}
+    assert "linux-only" in tos and "modern" in tos
+    assert not (tos & {"win-only", "arm-only", "oldie"})
+
+
+def test_markers_activate_by_request_environment_windows_arm():
+    out, err = resolve(
+        _marker_repo(), "app",
+        env={"python_version": "3.9", "sys_platform": "win32",
+             "platform_machine": "aarch64"},
+    )
+    assert err is None
+    assert out["locked"] == {"app": "1.0", "arm-only": "1.0", "oldie": "0.9",
+                             "win-only": "1.0"}
+    tos = {e["to"] for e in out["edges"]}
+    assert not (tos & {"linux-only", "modern"})
+
+
+def test_marker_compound_and_or():
+    repo = {
+        "app": [c("1.0", [
+            d("py311-x64",
+              marker="python_version >= '3.11' and platform_machine == 'x86_64'"),
+            d("fallback",
+              marker="sys_platform == 'darwin' or python_version < '3.8'"),
+        ])],
+        "py311-x64": [c("1.0")],
+        "fallback": [c("1.0")],
+    }
+    env = {"python_version": "3.12", "sys_platform": "linux",
+           "platform_machine": "x86_64"}
+    out, err = resolve(repo, "app", env=env)
+    assert err is None
+    assert set(out["locked"]) == {"app", "py311-x64"}
+
+    env2 = {"python_version": "3.12", "sys_platform": "darwin",
+            "platform_machine": "arm64"}
+    out2, err2 = resolve(repo, "app", env=env2)
+    assert err2 is None
+    assert set(out2["locked"]) == {"app", "fallback"}
+
+
+def test_inactive_dependency_does_not_cause_conflict():
+    """未激活依赖即使引用了不存在/无解的包，也不得影响结果。"""
+    repo = {
+        "app": [c("1.0", [
+            d("ghost", ">=99", "sys_platform == 'win32'"),
+            d("real", "==1.0", "sys_platform == 'linux'"),
+        ])],
+        "real": [c("1.0")],
+    }
+    out, err = resolve(repo, "app", env={
+        "python_version": "3.11", "sys_platform": "linux",
+        "platform_machine": "x86_64"})
+    assert err is None
+    assert out["locked"] == {"app": "1.0", "real": "1.0"}
+
+
+def test_inactive_transitive_dependency_filtered():
+    """marker 位于传递层：未激活的传递依赖同样不进入约束与边。"""
+    repo = {
+        "app": [c("1.0", [d("mid")])],
+        "mid": [c("1.0", [
+            d("shared", ">=2", "sys_platform == 'linux'"),
+            d("shared", "<2", "sys_platform == 'win32'"),
+        ])],
+        "shared": [c("1.0"), c("2.0")],
+    }
+    out_linux, err = resolve(repo, "app", env={
+        "python_version": "3.11", "sys_platform": "linux",
+        "platform_machine": "x86_64"})
+    assert err is None and out_linux["locked"]["shared"] == "2.0"
+
+    out_win, err2 = resolve(repo, "app", env={
+        "python_version": "3.11", "sys_platform": "win32",
+        "platform_machine": "AMD64"})
+    assert err2 is None and out_win["locked"]["shared"] == "1.0"
+
+
+def test_active_dependency_still_drives_backtracking_and_chain():
+    """激活的 marker 依赖造成的无解，冲突链必须完整定位到该依赖。"""
+    repo = {
+        "app": [c("1.0", [
+            d("a", marker="sys_platform == 'linux'"),
+            d("b", marker="sys_platform == 'linux'"),
+        ])],
+        "a": [c("1.0", [d("core", "==1.0")])],
+        "b": [c("1.0", [d("core", "==2.0")])],
+        "core": [c("1.0"), c("2.0")],
+    }
+    out, err = resolve(repo, "app", env={
+        "python_version": "3.11", "sys_platform": "linux",
+        "platform_machine": "x86_64"})
+    assert out is None
+    core = next(x for x in err["_conflicts"] if x["subject"] == "core")
+    chain_specs = {
+        tuple(link["requires"] for link in cc["chain"])
+        for cc in core["constraints"]
+    }
+    assert ("*", "*", "==1.0") in chain_specs
+    assert ("*", "*", "==2.0") in chain_specs
+
+    # 同一快照切到 win32：两条依赖均未激活，直接成功。
+    out2, err2 = resolve(repo, "app", env={
+        "python_version": "3.11", "sys_platform": "win32",
+        "platform_machine": "AMD64"})
+    assert err2 is None and out2["locked"] == {"app": "1.0"}
+
+
+def test_markers_deterministic_across_repeated_resolves():
+    repo = _marker_repo()
+    env = {"python_version": "3.11", "sys_platform": "linux",
+           "platform_machine": "x86_64"}
+    out1, e1 = resolve(repo, "app", env=env)
+    out2, e2 = resolve(repo, "app", env=dict(reversed(list(env.items()))))
+    assert out1 == out2 and e1 == e2
+
+
+def test_invalid_marker_syntax_raises_snapshot_error():
+    repo = {"app": [c("1.0", [d("x", marker="python_version ==")])]}
+    with pytest.raises(SnapshotError) as exc:
+        build_repository(repo, DEFAULT_ENV)
+    message = str(exc.value)
+    # 定位到包、版本与依赖
+    assert "app" in message and "1.0" in message and "x" in message
+
+
+def test_marker_referencing_disallowed_variable_raises():
+    for bad_var in ("implementation_name", "os_name", "platform_release",
+                    "platform_system", "python_full_version", "extra",
+                    "platform_version"):
+        repo = {"app": [c("1.0", [d("x", marker=f"{bad_var} == 'z'")])]}
+        with pytest.raises(SnapshotError) as exc:
+            build_repository(repo, DEFAULT_ENV)
+        assert bad_var in str(exc.value)
+        assert "python_version" in str(exc.value)  # 提示允许的变量
+
+
+def test_invalid_python_version_in_environment_raises():
+    with pytest.raises(SnapshotError) as exc:
+        build_repository(
+            {"app": [c("1.0")]},
+            {"python_version": "banana", "sys_platform": "linux",
+             "platform_machine": "x86_64"},
+        )
+    assert "python_version" in str(exc.value)
+
+
+def test_inactive_deps_still_validated_for_marker_syntax():
+    """即使依赖在该环境下不激活，非法 marker 仍须返回错误（不静默忽略）。"""
+    repo = {"app": [c("1.0", [d("x", marker="not-a-marker !!")])]}
+    with pytest.raises(SnapshotError):
+        build_repository(repo, {
+            "python_version": "3.11", "sys_platform": "win32",
+            "platform_machine": "x86_64"})
+
+
+def test_duplicate_version_markers_resolve_before_conflict_check():
+    """同包同版本重复声明时，按激活后的依赖集合比较；两条声明激活结果一致即合法。"""
+    repo = {
+        "app": [
+            c("1.0", [d("x", marker="sys_platform == 'linux'")]),
+            c("1.0", [d("x", marker="sys_platform == 'linux'")]),
+        ],
+        "x": [c("1.0")],
+    }
+    repo = build_repository(repo, DEFAULT_ENV)
+    out_repo = Resolver(repo).resolve(
+        canonical("app"), parse_root_specifier(""), "")
+    assert out_repo is not None

@@ -24,5 +24,10 @@
   },
   "root": "app",
   "specifier": "",
-  "allow_prereleases": false
+  "allow_prereleases": false,
+  "target_environment": {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64"
+  }
 }
